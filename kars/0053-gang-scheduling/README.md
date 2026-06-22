@@ -37,6 +37,8 @@ The test verifies that a gang scheduling solution running on the platform enforc
 
 3. **Cleanup**: Delete the test workload and verify resources are released.
 
+This is implemented by `TestGangScheduling` in the AI conformance test suite (see [test/gang_scheduling_test.go](../../test/gang_scheduling_test.go)). The test uses [Kueue](https://kueue.sigs.k8s.io/): it provisions a `ClusterQueue` with a small CPU quota and submits two Jobs labeled for that queue. The positive case submits a Job that fits the quota and verifies all of its pods are scheduled; the negative case submits a Job that exceeds the quota and verifies Kueue does not admit it, so no pods are created or scheduled within a configurable wait period.
+
 ## Implementation History
 
 2026-03-12: KAR created

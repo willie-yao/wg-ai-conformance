@@ -23,6 +23,20 @@ go test -v ./test [-run <TestName>] [-kubeconfig=<path/to/kubeconfig>] [-acceler
 | Test Name | Requirement Covered | Requirement Level |
 |-|-|-|
 | `TestSecureAcceleratorAccess` | Secure Accelerator Access | MUST |
+| `TestGangScheduling` | Gang Scheduling | MUST |
+
+### Gang Scheduling Prerequisites
+
+`TestGangScheduling` requires the [Kueue](https://kueue.sigs.k8s.io/) gang
+scheduling solution to be installed on the cluster. The test creates its own
+`ResourceFlavor`, `ClusterQueue` (with a small CPU quota), and `LocalQueue`, then
+submits Jobs to verify all-or-nothing admission: a Job that fits the quota has all
+its pods scheduled, while a Job that exceeds it is not admitted and creates no pods.
+
+```bash
+# '-gang-negative-wait' is how long to confirm no partial scheduling occurs.
+go test -v ./test -run TestGangScheduling [-gang-negative-wait=45s]
+```
 
 ## Vendor Customization & Neutrality
 
