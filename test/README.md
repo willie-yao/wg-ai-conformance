@@ -3,8 +3,9 @@ To run these AI Conformance tests, you must have:
 
 - Golang: Installed on your local machine.
 - Kubeconfig: A valid kubeconfig file with cluster-admin permissions for the target cluster.
-- Accelerator Node Pool: The cluster must have nodes with accelerators exposed through the Kubernetes resource management framework — either a DRA driver (ResourceClaims against a DeviceClass such as `gpu.nvidia.com`) or a device plugin (extended resources such as `nvidia.com/gpu`). Make sure your nodes allow testing pods to be scheduled on them (e.g. no taints that prevent scheduling).
+- Accelerator Node Pool: The cluster must have nodes with accelerators exposed through the Kubernetes resource management framework, either a DRA driver (ResourceClaims against a DeviceClass such as `gpu.nvidia.com`) or a device plugin (extended resources such as `nvidia.com/gpu`). Make sure your nodes allow testing pods to be scheduled on them (e.g. no taints that prevent scheduling).
 - Cluster Autoscaling Test: `TestAcceleratorClusterAutoscaling` additionally requires a running cluster autoscaler and an isolated accelerator pool with minimum size `N >= 1`, maximum size at least `N+1`, effective capacity for exactly one requested accelerator per baseline node, scale-down enabled, sufficient cloud quota/stock, and one stable node label inherited by new pool nodes. The pool must contain no non-DaemonSet workloads or other Pending Pods explicitly selecting the pool. Device-plugin mode permits unrelated running accelerator workloads outside the pool but rejects other Pending Pods requesting the configured extended resource. DRA mode requires no other active Pods with ResourceClaims or allocated ResourceClaims outside the test namespace while the test runs because DRA devices may use shared topology.
+- HPA Autoscaling Test: `TestAcceleratorHorizontalPodAutoscaling` additionally requires the `autoscaling/v2` HPA API, a preconfigured `custom.metrics.k8s.io` adapter, API server Pod proxy connectivity, and capacity for two simultaneous accelerator allocations.
 - Network Access: The test machine must be able to reach the Kubernetes API server.
 
 ## Running the Tests
@@ -23,7 +24,7 @@ Run `go test ./test -args -help` for details about each flag.
 The allocation-mode detection, pod-construction, and device-probe logic also has hermetic unit tests that need no cluster (Kubernetes API tests use a fake clientset):
 
 ```bash
-go test -v ./test -run 'Test(DetectAllocationMode|ExtendedResourceGuardFailsClosed|LookupAcceleratorConfig|BuildTestPod|PodGeneratedClaims|DeleteAndAwaitRelease|AcceleratorProbeCommand|LogsContainExactLine)$'
+go test -v ./test -run 'Test(DetectAllocationMode|ExtendedResourceGuardFailsClosed|LookupAcceleratorConfig|BuildTestPod|PodGeneratedClaims|DeleteAndAwaitRelease|AcceleratorProbeCommand|LogsContainExactLine|BuildHPADeployment|ParsePodMetrics|ClassifyAcceleratorCapacityShortfall)$'
 ```
 
 ### Test Cases Covered
@@ -33,6 +34,7 @@ go test -v ./test -run 'Test(DetectAllocationMode|ExtendedResourceGuardFailsClos
 | `TestSecureAcceleratorAccess` | Secure Accelerator Access | MUST |
 | `TestGangScheduling` | Gang Scheduling | MUST |
 | `TestAcceleratorClusterAutoscaling` | Effective Cluster Autoscaling for Accelerators | MUST |
+| `TestAcceleratorHorizontalPodAutoscaling` | Effective HPA Autoscaling for AI Workloads | MUST |
 
 ### Accelerator Cluster Autoscaling
 
@@ -100,6 +102,96 @@ Node UID is no longer Ready or has been deleted, and the selected pool has
 exactly `N` Ready Nodes for the stability window. The Kubernetes API cannot
 portably prove a cloud provider's node-group size, and Cluster Autoscaler does
 not itself guarantee deletion of the Kubernetes `Node` object.
+
+### Accelerator Horizontal Pod Autoscaling
+
+`TestAcceleratorHorizontalPodAutoscaling` verifies that an `autoscaling/v2`
+HorizontalPodAutoscaler can scale an accelerator-backed Deployment from one to
+two Ready replicas and back to one using a per-Pod custom metric. It supports
+both DRA and device-plugin allocation through the suite-wide `-allocation-mode`
+flag and requires capacity for two simultaneous accelerator allocations.
+
+The Go test does not install or modify a custom metrics adapter, APIService,
+RBAC, PodMonitor, or PodMonitoring resource. Before the test runs, the platform
+must serve `custom.metrics.k8s.io/v1beta1`, allow API server Pod proxy requests,
+and expose the configured resource-consumer metric unchanged as an
+instantaneous per-Pod gauge. The name exposed by the adapter must exactly match
+`-hpa-custom-metric-name`.
+
+Before running the test, verify that the custom metrics APIService and discovery
+endpoint are available:
+
+```bash
+kubectl get apiservice v1beta1.custom.metrics.k8s.io
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1"
+```
+
+The value passed to `-hpa-custom-metric-name` must not end in `_total` or
+`_seconds_total` and must not begin with `container_`. The default
+prometheus-adapter rules wrap `_total` series in `rate()` and treat `container_`
+series as cAdvisor container metrics, while the test requires the value to equal
+exactly 100. Use the same metric name for the workload bump and the series served
+by the adapter.
+
+The test is skipped only when `-hpa-custom-metric-name` is unset, before
+kubeconfig access. A skipped result is not conformance evidence. Use manual
+attestation when HPA is supported only through external, object, or push-based
+metrics. Mark `pod_autoscaling` `N/A` only when HPA itself is unsupported.
+
+The three HPA-specific flags are:
+
+- `-hpa-custom-metric-name=<metric>` opts in and names the per-Pod gauge.
+- `-hpa-namespace=<namespace>` uses an existing namespace. When omitted, the
+  test creates and deletes a namespace.
+- `-hpa-metric-timeout=<duration>` controls metric propagation waits and
+  defaults to `12m`. This accommodates a common 10-minute adapter relist
+  interval plus scrape and propagation time.
+
+The generated-namespace default requires cluster-wide scrape coverage. If an
+operator's PodMonitor or ServiceMonitor watches only selected namespaces, pass
+`-hpa-namespace` with a namespace that configuration already watches.
+
+Scale-up and scale-down each use a fixed 10-minute timeout. The HPA has a fixed
+60-second scale-down stabilization window, and the final one-replica state must
+remain stable for 30 seconds.
+
+The resource-consumer `/BumpMetric` endpoint raises the initial Pod's metric to
+exactly 100 before HPA creation. Every bump is single-shot and expires after
+seven days, so it cannot silently revert during the test. After scale-up, a
+zero-valued series is registered for the second Pod. This is not needed for HPA
+calculation. It makes the final all-zero assertion non-vacuous by proving that
+both scaled Pods were represented by the custom metrics API.
+
+Created Pods carry the standard `prometheus.io/scrape`, `prometheus.io/port`,
+and `prometheus.io/path` annotations. Label-based monitoring must select the
+fixed `ai-conformance.kubernetes.io/test=kar-0057` label in the supplied
+namespace. The run label is used internally to isolate Pod and metric queries.
+
+If the HPA requests two replicas but the second Pod has a narrowly identified
+accelerator-capacity scheduling failure, the test fails with `ENVIRONMENT
+ERROR:` and preserves the scheduler condition. Other scheduling, image,
+readiness, claim, metrics, or HPA failures remain test failures. Cleanup removes
+the HPA, Deployment, Pods, generated claims, and run-scoped claim template. A
+supplied namespace and its monitoring configuration are left unchanged.
+
+A healthy run finishes in a few minutes, but use `-timeout 90m` so the harness
+exceeds the test's internal polling and cleanup budgets; otherwise the Go test
+binary can panic before the test emits its own `ENVIRONMENT ERROR:`, `METRICS
+PIPELINE FAILURE:`, or accelerator-capacity diagnostic.
+
+```bash
+go test -v ./test \
+  -run '^TestAcceleratorHorizontalPodAutoscaling$' \
+  -timeout 90m \
+  -accelerator-type=nvidia \
+  -allocation-mode=device-plugin \
+  -hpa-custom-metric-name=ai_conformance_queue_depth \
+  -hpa-namespace=ai-conformance-hpa
+```
+
+Repeat with `-allocation-mode=dra` to validate DRA. The HPA-specific hermetic
+coverage consists of `TestBuildHPADeployment`, `TestParsePodMetrics`, and
+`TestClassifyAcceleratorCapacityShortfall`.
 
 ## Vendor Customization & Neutrality
 
