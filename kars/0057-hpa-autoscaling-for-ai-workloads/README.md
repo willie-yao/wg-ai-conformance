@@ -29,15 +29,15 @@ A custom metrics pipeline is configured to expose accelerator-related custom met
 
 ### Automated Tests
 
-The test verifies that the HorizontalPodAutoscaler running on the platform can scale accelerator-backed pods based on a custom metric.
+The automated test uses a preconfigured custom metrics pipeline and does not install, replace, or remove an adapter or monitoring resource.
 
-1. **Setup**: Deploy a custom metrics adapter exposing a configurable test metric. Create a Deployment whose pods each request an accelerator and emit the custom metric, and an HPA targeting the Deployment with a defined target value for that metric.
+1. **Applicability**: Outside short mode, run the test with a per-Pod gauge name when HPA is supported through `custom.metrics.k8s.io/v1beta1`; otherwise use the requirement's manual attestation path. A short-mode or unconfigured skip is not conformance evidence.
+2. **Metric preflight**: Create one accelerator-backed replica, raise its metric to exactly 100, and verify the unchanged value through the custom metrics API before creating the HPA.
+3. **Scale up**: Create an `autoscaling/v2` HPA with a `Pods` metric target and downscaling disabled. Verify that it requests two replicas and both accelerator-backed Pods become Ready. If readiness fails, fresh evidence of an accelerator-capacity scheduling shortfall produces `ENVIRONMENT ERROR:` with the Unschedulable condition and original readiness error.
+4. **Scale down**: Register the second Pod's zero series, lower the first Pod to zero, and verify both series are zero before enabling HPA downscaling. Require a stable return to one Ready replica without directly changing replica counts.
+5. **Cleanup**: Delete test resources, wait for the Deployment and Pods to disappear and generated claims to be removed or deallocated, and leave a supplied namespace and its monitoring configuration unchanged. Incomplete cleanup fails the test.
 
-2. **Scale-up case**: Drive the custom metric above the target. Verify that the HPA increases the replica count and that new pods reach `Running` on accelerator-equipped nodes.
-
-3. **Scale-down case**: Lower the custom metric below the target. Verify that the HPA decreases the replica count after the stabilization window.
-
-4. **Cleanup**: Delete the HPA, Deployment, and custom metrics adapter.
+This is implemented by [`TestAcceleratorHorizontalPodAutoscaling`](../../test/hpa_autoscaling_test.go).
 
 ## Implementation History
 
